@@ -55,20 +55,42 @@ func runClient(daemonAddr string, localAddr, remoteAddr snet.UDPAddr) {
 	if err != nil {
 		log.Fatalf("Failed to bind UDP connection: %v", err)
 	}
-	defer conn.Close()
 
 	var wg sync.WaitGroup
 	wg.Add(1)
 
 	var currentPath int = 0
+	sendingTimes := make([]time.Time, 10000)
+	received := make([]bool, 10000)
+	receivingTimes := make([]time.Time, 10000)
 
 	// Send Packet
-	go sendPackets(conn, localAddr, remoteAddr, ps, &wg, &currentPath)
+	go sendPackets(conn, localAddr, remoteAddr, ps, &wg, &currentPath, sendingTimes)
 
 	// Receive Packet
-	go receivePackets(conn, ps, &currentPath)
+	go receivePackets(conn, ps, &currentPath, received, receivingTimes)
 
 	wg.Wait()
+
+	totalReceived := 0
+	rttSum := time.Duration(0)
+	lastReceived := -1
+	reconnectTimes := make([]time.Duration, 0, 100)
+	for i := range 10000 {
+		if received[i] {
+			totalReceived += 1
+			rttSum += receivingTimes[i].Sub(sendingTimes[i])
+			if !(lastReceived == i-1) && lastReceived != -1 {
+				reconnectTimes = append(reconnectTimes, receivingTimes[i].Sub(receivingTimes[lastReceived]))
+			}
+			lastReceived = i
+		}
+	}
+
+	log.Print("Stats:")
+	log.Printf("Total Received: %v", totalReceived)
+	log.Printf("RTT Average: %v", rttSum/time.Duration(totalReceived))
+	log.Printf("ReconnectTimes: %v", reconnectTimes)
 }
 
 func contains(path path.Path, ia addr.IA, interfaceId uint64) bool {
@@ -94,17 +116,24 @@ func contains(path path.Path, ia addr.IA, interfaceId uint64) bool {
 	return false
 }
 
-func receivePackets(conn *net.UDPConn, paths []snet.Path, currentPath *int) {
+func receivePackets(conn *net.UDPConn, paths []snet.Path, currentPath *int, received []bool, receivingTimes []time.Time) {
+	defer conn.Close()
+
 	failedPaths := make([]bool, len(paths))
 	for {
 		// check if we have healthy paths left and set one
 		if failedPaths[*currentPath] {
+			hasHealthy := false
 			for i := *currentPath; i < len(paths); i++ {
 				if !failedPaths[i] {
 					log.Printf("Switching to Path: %d", i)
 					*currentPath = i
+					hasHealthy = true
 					break
 				}
+			}
+			if !hasHealthy {
+				log.Fatal("No More Healthy Paths")
 			}
 		}
 		pkt := &snet.Packet{}
@@ -129,7 +158,9 @@ func receivePackets(conn *net.UDPConn, paths []snet.Path, currentPath *int) {
 
 		pld, ok := pkt.Payload.(snet.UDPPayload)
 		if ok {
-			log.Printf("Received data: \"%d\"", binary.LittleEndian.Uint32(pld.Payload))
+			id := binary.LittleEndian.Uint32(pld.Payload)
+			received[id] = true
+			receivingTimes[id] = time.Now()
 			continue
 		}
 		scmp, ok := pkt.Payload.(snet.SCMPPayload)
@@ -154,12 +185,10 @@ func receivePackets(conn *net.UDPConn, paths []snet.Path, currentPath *int) {
 	}
 }
 
-func sendPackets(conn *net.UDPConn, localAddr, remoteAddr snet.UDPAddr, paths []snet.Path, wg *sync.WaitGroup, currentPath *int) {
+func sendPackets(conn *net.UDPConn, localAddr, remoteAddr snet.UDPAddr, paths []snet.Path, wg *sync.WaitGroup, currentPath *int, sendingTimes []time.Time) {
 	defer wg.Done()
 	data := make([]byte, 4)
-	for i := range uint32(10000) {
-		log.Printf("Sending New Message. %d over path %d", i, *currentPath)
-
+	for i := range uint32(1000) {
 		path := paths[*currentPath]
 		binary.LittleEndian.PutUint32(data, i)
 		srcAddr, ok := netip.AddrFromSlice(localAddr.Host.IP)
@@ -206,6 +235,7 @@ func sendPackets(conn *net.UDPConn, localAddr, remoteAddr snet.UDPAddr, paths []
 		if err != nil {
 			log.Fatalf("Failed to write packet: %v", err)
 		}
+		sendingTimes[i] = time.Now()
 		time.Sleep(time.Duration(interval) * time.Millisecond)
 	}
 	// wait for response of last packets
