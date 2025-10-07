@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"net/netip"
+	"os"
 	"sync"
 	"time"
 
@@ -25,6 +26,14 @@ const (
 )
 
 func runClient(daemonAddr string, localAddr, remoteAddr snet.UDPAddr) {
+	logFile, err := os.OpenFile("fast-failover-client.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	if err != nil {
+		log.Fatalf("Failed to open log file: %v", err)
+	}
+	defer logFile.Close()
+
+	log.SetOutput(logFile)
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	ctx := context.Background()
 
 	dc, err := daemon.NewService(daemonAddr).Connect(ctx)
@@ -148,7 +157,6 @@ func receivePackets(conn *net.UDPConn, paths []snet.Path, currentPath *int, rece
 				log.Fatalf("Failed to read packet: %v", err)
 			}
 		}
-		log.Print("Receiving New Message.")
 		pkt.Bytes = pkt.Bytes[:n]
 
 		err = pkt.Decode()
